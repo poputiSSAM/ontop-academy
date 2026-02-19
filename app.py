@@ -25,28 +25,27 @@ except ImportError:
     pass 
 
 # ==========================================
-# 2. 구글 스프레드시트 연결 설정 (핵심!)
+# 2. 구글 스프레드시트 연결 설정 (캐싱 적용)
 # ==========================================
-# 구글 시트 이름 (구글 드라이브에 이 이름으로 파일을 만들어두세요)
 SHEET_NAME = "ontop_db" 
 
-# 이미지 저장을 위한 로컬 폴더 (이미지는 시트에 저장 불가하므로 임시 저장됨)
 IMAGE_DIR = "problem_images"
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
 
-# --- 구글 시트 인증 및 연결 함수 (캐싱 사용) ---
+# [최적화 1] 연결 객체 캐싱 (접속을 한 번만 함)
 @st.cache_resource
 def init_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    # secrets.toml에서 인증 정보 가져오기
     creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], scope)
     client = gspread.authorize(creds)
     return client
 
-# --- 데이터 로드 함수 (구글 시트) ---
+# [최적화 2] 데이터 로드 캐싱 (API 호출 최소화)
+# ttl=60: 60초 동안은 다시 부르지 않고 저장된 거 씀 (새로고침 누르면 갱신)
+@st.cache_data(ttl=60)
 def load_data(worksheet_name, columns):
-    """구글 시트의 특정 탭(worksheet_name)에서 데이터를 가져옵니다."""
+    """구글 시트에서 데이터를 가져옵니다."""
     try:
         client = init_connection()
         sheet = client.open(SHEET_NAME)
@@ -55,26 +54,24 @@ def load_data(worksheet_name, columns):
             data = worksheet.get_all_records()
             df = pd.DataFrame(data)
             
-            # 모든 데이터를 문자열로 변환 (에러 방지)
-            df = df.astype(str)
+            df = df.astype(str) # 모든 데이터 문자열 변환
             
-            # 필수 컬럼이 없으면 추가 (빈 데이터프레임일 경우 대비)
+            # 필수 컬럼 보장
             for col in columns:
                 if col not in df.columns:
                     df[col] = ""
             return df
         except gspread.WorksheetNotFound:
-            # 탭이 없으면 새로 생성하고 헤더 추가
             worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
-            worksheet.append_row(columns) # 헤더 추가
+            worksheet.append_row(columns)
             return pd.DataFrame(columns=columns)
     except Exception as e:
-        # 연결 오류 시 빈 데이터프레임 반환 (앱이 죽지 않도록)
+        # st.error(f"데이터 로드 중 오류: {e}") # 사용자에게는 안 보이게 처리
         return pd.DataFrame(columns=columns)
 
-# --- 데이터 저장 함수 (구글 시트) ---
+# [최적화 3] 데이터 저장 시 캐시 삭제 (즉시 반영을 위해)
 def save_data(worksheet_name, new_df):
-    """데이터프레임을 구글 시트의 특정 탭에 덮어씁니다."""
+    """구글 시트에 데이터를 저장하고 캐시를 비웁니다."""
     try:
         client = init_connection()
         sheet = client.open(SHEET_NAME)
@@ -83,14 +80,16 @@ def save_data(worksheet_name, new_df):
         except gspread.WorksheetNotFound:
             worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
         
-        # 데이터프레임 내용을 리스트로 변환 (헤더 포함)
         params = [new_df.columns.values.tolist()] + new_df.values.tolist()
         
-        # 시트 클리어 후 업데이트
         worksheet.clear()
         worksheet.update(params)
+        
+        # [중요] 저장 후 캐시를 비워서 다음 로드 때 새 데이터를 가져오게 함
+        st.cache_data.clear()
+        
     except Exception as e:
-        st.error(f"저장 중 오류 발생: {e}")
+        st.error(f"저장 중 오류 발생 (잠시 후 다시 시도하세요): {e}")
 
 # --- 유틸리티 함수들 ---
 def make_hashes(password):
@@ -107,8 +106,8 @@ def get_yt_start_time(url):
     match = re.search(r'[?&](t|start)=(\d+)', url)
     return int(match.group(2)) if match else 0
 
-# --- 초기 계정 세팅 (DB 확인 후 없으면 생성) ---
-# users 탭 확인 (파일명 대신 탭 이름 'users' 사용)
+# --- 초기 계정 세팅 ---
+# (캐싱된 load_data 사용)
 df_check = load_data('users', ['id'])
 if df_check.empty:
     default_users = pd.DataFrame([
@@ -120,25 +119,21 @@ if df_check.empty:
     ])
     save_data('users', default_users)
 
-
 # ==========================================
 # 3. UI 스타일 및 세션 초기화
 # ==========================================
 st.set_page_config(page_title="온탑영어펀한수학학원", layout="wide", page_icon="🎓")
 
-# 세션 초기화
 if 'logged_in' not in st.session_state: st.session_state.update({'logged_in': False, 'user_id': None, 'user_role': None, 'user_name': None, 'user_subject': "", 'linked_student': ""})
 if 'cal_view_date' not in st.session_state: st.session_state['cal_view_date'] = None
 if 'last_result' not in st.session_state: st.session_state['last_result'] = None 
 if 'current_options' not in st.session_state: st.session_state['current_options'] = None
 
-# 모바일 최적화 CSS
 st.markdown("""
     <style>
     .stApp { background-color: #F8F9FA; }
     .main-title { font-size: 2.0rem; font-weight: 800; color: #1E3A8A; text-align: center; margin-bottom: 20px; }
     
-    /* 플래시카드 */
     .flashcard {
         background-color: white; padding: 40px 20px; border-radius: 20px;
         box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align: center;
@@ -153,14 +148,10 @@ st.markdown("""
     .meaning-text { font-size: 1.8rem; color: #2563EB; font-weight: 600; margin-top: 15px; }
     .book-badge { background-color: #DBEAFE; color: #1E40AF; padding: 5px 10px; border-radius: 15px; font-size: 0.8rem; margin-bottom: 10px; display: inline-block; }
     
-    /* 버튼 */
     div.stButton > button { width: 100%; border-radius: 8px; font-weight: bold; height: 45px; }
     
-    @keyframes shake {
-        0% { transform: translate(1px, 1px) rotate(0deg); } 20% { transform: translate(-3px, 0px) rotate(1deg); } 40% { transform: translate(1px, -1px) rotate(1deg); } 60% { transform: translate(-3px, 1px) rotate(0deg); } 80% { transform: translate(-1px, -1px) rotate(1deg); } 100% { transform: translate(1px, -2px) rotate(-1deg); }
-    }
+    @keyframes shake { 0% { transform: translate(1px, 1px) rotate(0deg); } 20% { transform: translate(-3px, 0px) rotate(1deg); } 40% { transform: translate(1px, -1px) rotate(1deg); } 60% { transform: translate(-3px, 1px) rotate(0deg); } 80% { transform: translate(-1px, -1px) rotate(1deg); } 100% { transform: translate(1px, -2px) rotate(-1deg); } }
     
-    /* 모바일 달력 및 UI 최적화 */
     @media only screen and (max-width: 640px) {
         div[data-testid="stHorizontalBlock"] { flex-direction: row !important; flex-wrap: nowrap !important; gap: 1px !important; }
         div[data-testid="column"] { min-width: 0px !important; flex: 1 1 auto !important; width: auto !important; padding: 0px !important; }
@@ -204,7 +195,6 @@ def render_flashcard_session():
             st.balloons()
             st.success(f"## 🏁 테스트 종료! 점수: {score} / {total}")
             if st.button("결과 저장 및 종료", type="primary", key="btn_save_test", use_container_width=True):
-                # 탭: vocab_test_log
                 df_test = load_data('vocab_test_log', ['student_id', 'date', 'info', 'score'])
                 new_log = pd.DataFrame([{
                     'student_id': user_id,
@@ -246,7 +236,6 @@ def render_flashcard_session():
         """, unsafe_allow_html=True)
         
         if st.session_state['current_options'] is None:
-            # 탭: vocab
             df_vocab = load_data('vocab', ['book', 'word', 'meaning'])
             same_book_words = df_vocab[df_vocab['book'] == book_text]['meaning'].tolist()
             if len(same_book_words) < 4: same_book_words = df_vocab['meaning'].tolist()
@@ -278,7 +267,7 @@ def render_flashcard_session():
                     time.sleep(1.0)
                     st.rerun()
 
-    # [모드 2] 주관식 (비밀번호 타입)
+    # [모드 2] 주관식
     elif mode == 'subjective' or mode == 'test_subjective':
         st.markdown(f"""
             <div class="{card_class}">
@@ -360,7 +349,6 @@ def update_vocab_progress(user_id, word_data, is_correct, mode):
             st.session_state['test_score'] += 1
             return 
         else:
-            # 탭: vocab_test_wrongs
             df_t_wrong = load_data('vocab_test_wrongs', ['student_id', 'book', 'word', 'date'])
             if not ((df_t_wrong['student_id'] == user_id) & (df_t_wrong['word'] == word_data['word'])).any():
                 new_w = pd.DataFrame([{
@@ -370,7 +358,6 @@ def update_vocab_progress(user_id, word_data, is_correct, mode):
                 save_data('vocab_test_wrongs', pd.concat([df_t_wrong, new_w], ignore_index=True))
             return
 
-    # 탭: vocab_prog
     df_prog = load_data('vocab_prog', ['student_id', 'book', 'word', 'streak', 'status'])
     mask = (df_prog['student_id'] == user_id) & (df_prog['book'] == word_data.get('book','')) & (df_prog['word'] == word_data['word'])
     current = df_prog[mask]
@@ -397,7 +384,6 @@ def update_vocab_progress(user_id, word_data, is_correct, mode):
 
 def vocab_study_session(user_id):
     st.subheader("🧠 단어 마스터 프로그램")
-    # 탭: vocab, vocab_prog
     df_vocab = load_data('vocab', ['book', 'day', 'word', 'meaning'])
     df_prog = load_data('vocab_prog', ['student_id', 'book', 'word', 'streak', 'status'])
     if df_vocab.empty: st.info("등록된 단어장이 없습니다."); return
@@ -487,7 +473,6 @@ def vocab_study_session(user_id):
     
     with t5:
         st.write("##### 🚧 누적 테스트 오답 노트")
-        # 탭: vocab_test_wrongs
         df_tw = load_data('vocab_test_wrongs', ['student_id', 'book', 'word', 'date'])
         my_tw = df_tw[df_tw['student_id'] == user_id]
         
@@ -496,10 +481,11 @@ def vocab_study_session(user_id):
             tw_details = pd.merge(my_tw, df_vocab, on=['book', 'word'], how='left')[['date', 'book', 'word', 'meaning']]
             st.dataframe(tw_details, use_container_width=True)
             
-            c_tr1, c_tr2 = st.columns(2)
-            if c_tr1.button("🔥 오답 학습하기", key="btn_study_tw", use_container_width=True):
+            if st.button("🔥 오답 학습하기", key="btn_study_tw", use_container_width=True):
                 start_flashcard_session(tw_details.to_dict('records'), user_id, "learning")
             
+            st.divider()
+            st.caption("오답 삭제")
             del_w = st.selectbox("삭제할 단어 선택", tw_details['word'], key="sel_del_tw")
             if c_tr2.button("삭제", key="btn_del_tw", use_container_width=True):
                 df_tw = df_tw[~((df_tw['student_id']==user_id) & (df_tw['word']==del_w))]
@@ -513,7 +499,6 @@ def vocab_study_session(user_id):
 # ==========================================
 def render_calendar(student_id):
     st.markdown("#### 📅 학습 기록 달력")
-    # 탭: learning_log
     df_log = load_data('learning_log', ['student_id', 'date', 'content', 'teacher_name', 'subject'])
     my_logs = df_log[df_log['student_id'] == student_id]
     
@@ -557,7 +542,6 @@ def login_page():
                 uid = st.text_input("아이디")
                 upw = st.text_input("비밀번호", type="password")
                 if st.form_submit_button("접속", use_container_width=True):
-                    # 탭: users
                     users = load_data('users', ['id', 'pw', 'name', 'role', 'class_group', 'linked_student', 'subject', 'math_class', 'eng_class'])
                     hpw = make_hashes(upw)
                     user = users[(users['id'] == uid) & (users['pw'] == hpw)]
@@ -595,7 +579,6 @@ def teacher_page():
         content = st.text_area("내용", height=100, key="log_content")
         if st.button("저장", type="primary", use_container_width=True, key="btn_save_log"):
             if content:
-                # 탭: learning_log
                 log = load_data('learning_log', ['student_id', 'date', 'content', 'teacher_name', 'subject'])
                 new = pd.DataFrame([{'student_id': target, 'date': str(date), 'content': content, 'teacher_name': st.session_state['user_name'], 'subject': st.session_state['user_subject']}])
                 save_data('learning_log', pd.concat([log, new], ignore_index=True))
@@ -646,7 +629,6 @@ def teacher_page():
                             for _, row in df.iterrows(): extracted_data.append({'book': bn, 'day': row['day'], 'word': row['word'], 'meaning': row['meaning']})
                     except: pass
                 if extracted_data:
-                    # 탭: vocab
                     df_vocab = load_data('vocab', ['book', 'day', 'word', 'meaning'])
                     save_data('vocab', pd.concat([df_vocab, pd.DataFrame(extracted_data)], ignore_index=True))
                     st.success(f"총 {len(extracted_data)}개 저장됨")
@@ -677,15 +659,18 @@ def teacher_page():
             with c1:
                 with st.expander("수정"):
                     tid = st.selectbox("ID", teachers['id'], key="sel_t_edt")
-                    cur = teachers[teachers['id']==tid].iloc[0]
-                    with st.form("te_edt"):
-                        nn = st.text_input("이름", cur['name'])
-                        np = st.text_input("비번")
-                        ns = st.text_input("과목", cur['subject'])
-                        if st.form_submit_button("저장"):
-                            hp = make_hashes(np) if np else cur['pw']
-                            users.loc[users['id']==tid, ['name','pw','subject']] = [nn,hp,ns]
-                            save_data('users', users); st.rerun()
+                    if not teachers.empty:
+                        cur_subset = teachers[teachers['id']==tid]
+                        if not cur_subset.empty:
+                            cur = cur_subset.iloc[0]
+                            with st.form("te_edt"):
+                                nn = st.text_input("이름", cur['name'])
+                                np = st.text_input("비번")
+                                ns = st.text_input("과목", cur['subject'])
+                                if st.form_submit_button("저장"):
+                                    hp = make_hashes(np) if np else cur['pw']
+                                    users.loc[users['id']==tid, ['name','pw','subject']] = [nn,hp,ns]
+                                    save_data('users', users); st.rerun()
             with c2:
                 with st.expander("삭제/추가"):
                     did = st.selectbox("삭제 ID", teachers['id'], key="sel_t_del")
@@ -711,16 +696,18 @@ def teacher_page():
             with st.expander("✏️ 학생 수정"):
                 if not stds.empty:
                     sid = st.selectbox("ID", stds['id'], key="sel_s_edt")
-                    sc = stds[stds['id']==sid].iloc[0]
-                    with st.form("se_edt"):
-                        nn = st.text_input("이름", sc['name'])
-                        np = st.text_input("비번")
-                        nm = st.text_input("수학반", sc['math_class'])
-                        ne = st.text_input("영어반", sc['eng_class'])
-                        if st.form_submit_button("저장"):
-                            hp = make_hashes(np) if np else sc['pw']
-                            users.loc[users['id']==sid, ['name','pw','math_class','eng_class']] = [nn,hp,nm,ne]
-                            save_data('users', users); st.rerun()
+                    cur_subset = stds[stds['id']==sid]
+                    if not cur_subset.empty:
+                        sc = cur_subset.iloc[0]
+                        with st.form("se_edt"):
+                            nn = st.text_input("이름", sc['name'])
+                            np = st.text_input("비번")
+                            nm = st.text_input("수학반", sc['math_class'])
+                            ne = st.text_input("영어반", sc['eng_class'])
+                            if st.form_submit_button("저장"):
+                                hp = make_hashes(np) if np else sc['pw']
+                                users.loc[users['id']==sid, ['name','pw','math_class','eng_class']] = [nn,hp,nm,ne]
+                                save_data('users', users); st.rerun()
         with c2:
             with st.expander("🗑️ 학생 삭제"):
                 if not stds.empty:
@@ -737,15 +724,17 @@ def teacher_page():
             with st.expander("✏️ 학부모 수정"):
                 if not parents.empty:
                     pid = st.selectbox("ID", parents['id'], key="sel_p_edt")
-                    pc = parents[parents['id']==pid].iloc[0]
-                    with st.form("pe_edt"):
-                        nn = st.text_input("이름", pc['name'])
-                        np = st.text_input("비번")
-                        nl = st.text_input("자녀ID", pc['linked_student'])
-                        if st.form_submit_button("저장"):
-                            hp = make_hashes(np) if np else pc['pw']
-                            users.loc[users['id']==pid, ['name','pw','linked_student']] = [nn,hp,nl]
-                            save_data('users', users); st.rerun()
+                    cur_subset = parents[parents['id']==pid]
+                    if not cur_subset.empty:
+                        pc = cur_subset.iloc[0]
+                        with st.form("pe_edt"):
+                            nn = st.text_input("이름", pc['name'])
+                            np = st.text_input("비번")
+                            nl = st.text_input("자녀ID", pc['linked_student'])
+                            if st.form_submit_button("저장"):
+                                hp = make_hashes(np) if np else pc['pw']
+                                users.loc[users['id']==pid, ['name','pw','linked_student']] = [nn,hp,nl]
+                                save_data('users', users); st.rerun()
         with c2:
              with st.expander("🗑️ 학부모 삭제"):
                 if not parents.empty:
@@ -771,7 +760,6 @@ def teacher_page():
         
         with sub_t1:
             st.write("##### 📊 반별 성적")
-            # 탭: score
             df_score = load_data('score', ['student_id', 'exam_name', 'subject', 'score', 'date'])
             df_users = load_data('users', ['id', 'name', 'math_class', 'eng_class'])
             
@@ -834,7 +822,6 @@ def teacher_page():
 
         with sub_t2:
             st.write("##### 📖 단어 테스트 기록")
-            # 탭: vocab_test_log
             df_test = load_data('vocab_test_log', ['student_id', 'date', 'info', 'score'])
             if not df_test.empty:
                 df_test = pd.merge(df_test, stds[['id', 'name']], left_on='student_id', right_on='id', how='left')
@@ -852,13 +839,11 @@ def teacher_page():
             paper_data = pd.DataFrame()
 
             if down_type == "일반 오답":
-                # 탭: vocab_prog
                 df_prog = load_data('vocab_prog', ['student_id', 'book', 'word', 'status'])
                 my_wrongs = df_prog[(df_prog['student_id'] == target_s) & (df_prog['status'] == 'learning')]
                 if not my_wrongs.empty:
                      paper_data = pd.merge(my_wrongs, df_vocab, on=['book', 'word'], how='left')[['book', 'word', 'meaning']]
             else:
-                # 탭: vocab_test_wrongs
                 df_tw = load_data('vocab_test_wrongs', ['student_id', 'book', 'word'])
                 my_wrongs = df_tw[df_tw['student_id'] == target_s]
                 if not my_wrongs.empty:
@@ -883,7 +868,6 @@ def teacher_page():
         ef = st.file_uploader("이미지", accept_multiple_files=True, key="up_exam_img")
         if st.button("업로드", key="btn_up_exam"):
             if en and ef:
-                # 탭: exam
                 dex = load_data('exam', ['시험명', '문제번호', '이미지경로', '영상링크'])
                 rows = []
                 for f in ef:
@@ -955,9 +939,7 @@ def student_page(user_id):
     
     with tabs[2]:
         st.write("##### 📝 시험지 오답 체크")
-        # 탭: exam
         df_exam = load_data('exam', ['시험명', '문제번호', '이미지경로', '영상링크'])
-        # 탭: mynote
         df_note = load_data('mynote', ['학생이름', '시험명', '문제번호', '메모'])
         
         if df_exam.empty: st.info("시험지 없음")
