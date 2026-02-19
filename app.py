@@ -9,6 +9,7 @@ import hashlib
 import math
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from gspread.exceptions import APIError # [NEW] 에러 처리를 위한 도구 추가
 
 # --------------------------------------------------------
 # 1. 라이브러리 로드 및 에러 처리
@@ -25,7 +26,7 @@ except ImportError:
     pass 
 
 # ==========================================
-# 2. 구글 스프레드시트 연결 설정 (캐싱 적용)
+# 2. 구글 스프레드시트 연결 설정 (안정성 강화)
 # ==========================================
 SHEET_NAME = "ontop_db" 
 
@@ -33,7 +34,7 @@ IMAGE_DIR = "problem_images"
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
 
-# [최적화 1] 연결 객체 캐싱 (접속을 한 번만 함)
+# [최적화 1] 연결 객체 캐싱
 @st.cache_resource
 def init_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -41,55 +42,78 @@ def init_connection():
     client = gspread.authorize(creds)
     return client
 
-# [최적화 2] 데이터 로드 캐싱 (API 호출 최소화)
-# ttl=60: 60초 동안은 다시 부르지 않고 저장된 거 씀 (새로고침 누르면 갱신)
-@st.cache_data(ttl=60)
+# [최적화 2] 데이터 로드 캐싱 + 재시도 로직
+# ttl=60 -> 300(5분)으로 늘려 불필요한 호출 감소
+@st.cache_data(ttl=300)
 def load_data(worksheet_name, columns):
-    """구글 시트에서 데이터를 가져옵니다."""
-    try:
-        client = init_connection()
-        sheet = client.open(SHEET_NAME)
+    """구글 시트에서 데이터를 가져옵니다. (재시도 로직 적용)"""
+    # 최대 5번까지 재시도
+    for attempt in range(5):
         try:
-            worksheet = sheet.worksheet(worksheet_name)
-            data = worksheet.get_all_records()
-            df = pd.DataFrame(data)
-            
-            df = df.astype(str) # 모든 데이터 문자열 변환
-            
-            # 필수 컬럼 보장
-            for col in columns:
-                if col not in df.columns:
-                    df[col] = ""
-            return df
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
-            worksheet.append_row(columns)
+            client = init_connection()
+            sheet = client.open(SHEET_NAME)
+            try:
+                worksheet = sheet.worksheet(worksheet_name)
+                data = worksheet.get_all_records()
+                df = pd.DataFrame(data)
+                
+                df = df.astype(str) # 문자열 변환
+                
+                for col in columns:
+                    if col not in df.columns:
+                        df[col] = ""
+                return df
+            except gspread.WorksheetNotFound:
+                worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
+                worksheet.append_row(columns)
+                return pd.DataFrame(columns=columns)
+                
+        except APIError as e:
+            # 429 에러(접속량 초과)일 경우 잠시 대기 후 재시도
+            if e.response.status_code == 429:
+                time.sleep((2 ** attempt) + random.random()) # 1초, 2초, 4초... 점진적 대기
+                continue
+            else:
+                return pd.DataFrame(columns=columns)
+        except Exception:
+            # 그 외 에러 시 빈 데이터 반환 (앱 다운 방지)
             return pd.DataFrame(columns=columns)
-    except Exception as e:
-        # st.error(f"데이터 로드 중 오류: {e}") # 사용자에게는 안 보이게 처리
-        return pd.DataFrame(columns=columns)
+            
+    return pd.DataFrame(columns=columns)
 
-# [최적화 3] 데이터 저장 시 캐시 삭제 (즉시 반영을 위해)
+# [최적화 3] 데이터 저장 + 재시도 로직
 def save_data(worksheet_name, new_df):
-    """구글 시트에 데이터를 저장하고 캐시를 비웁니다."""
-    try:
-        client = init_connection()
-        sheet = client.open(SHEET_NAME)
+    """구글 시트에 데이터를 저장합니다. (재시도 로직 적용)"""
+    for attempt in range(5):
         try:
-            worksheet = sheet.worksheet(worksheet_name)
-        except gspread.WorksheetNotFound:
-            worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
-        
-        params = [new_df.columns.values.tolist()] + new_df.values.tolist()
-        
-        worksheet.clear()
-        worksheet.update(params)
-        
-        # [중요] 저장 후 캐시를 비워서 다음 로드 때 새 데이터를 가져오게 함
-        st.cache_data.clear()
-        
-    except Exception as e:
-        st.error(f"저장 중 오류 발생 (잠시 후 다시 시도하세요): {e}")
+            client = init_connection()
+            sheet = client.open(SHEET_NAME)
+            try:
+                worksheet = sheet.worksheet(worksheet_name)
+            except gspread.WorksheetNotFound:
+                worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
+            
+            # 데이터프레임 내용을 리스트로 변환
+            params = [new_df.columns.values.tolist()] + new_df.values.tolist()
+            
+            worksheet.clear()
+            worksheet.update(params)
+            
+            # 저장 성공 시 캐시 비우고 종료
+            st.cache_data.clear()
+            return 
+            
+        except APIError as e:
+            if e.response.status_code == 429:
+                st.toast(f"⏳ 서버가 바빠서 잠시 기다립니다... ({attempt+1}/5)", icon="🕒")
+                time.sleep((2 ** attempt) + random.random())
+                continue
+            else:
+                st.error(f"저장 중 API 오류 발생: {e}")
+                return
+        except Exception as e:
+            st.error(f"저장 중 오류 발생: {e}")
+            return
 
 # --- 유틸리티 함수들 ---
 def make_hashes(password):
@@ -267,7 +291,7 @@ def render_flashcard_session():
                     time.sleep(1.0)
                     st.rerun()
 
-    # [모드 2] 주관식
+    # [모드 2] 주관식 (비밀번호 타입)
     elif mode == 'subjective' or mode == 'test_subjective':
         st.markdown(f"""
             <div class="{card_class}">
