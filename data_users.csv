@@ -1,0 +1,9 @@
+id,pw,name,role,subject,linked_student,class_group,math_class,eng_class
+admin,240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9,원장님,teacher,전체,,,,
+t_eng,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,어혜원,teacher,영어,,,,
+t_math,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,변승환,teacher,수학,,,,
+student1,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,김철수,student,,,고3 확통,,
+parent1,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,철수부모님,parent,,student1,,,
+t_mum,03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4,김보민,teacher,뮤엠,,,,
+donguk,52a6eb687cd22e80d3342eac6fcc7f2e19209e8f83eb9b82e81c6f3e6f30743b,이동욱,student,,,고3 확통,,
+dongukP,52a6eb687cd22e80d3342eac6fcc7f2e19209e8f83eb9b82e81c6f3e6f30743b,이동욱 학부모,parent,,donguk,,,
