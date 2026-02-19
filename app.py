@@ -9,7 +9,7 @@ import hashlib
 import math
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from gspread.exceptions import APIError # [NEW] 에러 처리를 위한 도구 추가
+from gspread.exceptions import APIError
 
 # --------------------------------------------------------
 # 1. 라이브러리 로드 및 에러 처리
@@ -26,7 +26,7 @@ except ImportError:
     pass 
 
 # ==========================================
-# 2. 구글 스프레드시트 연결 설정 (안정성 강화)
+# 2. 구글 스프레드시트 연결 설정 (최적화 적용)
 # ==========================================
 SHEET_NAME = "ontop_db" 
 
@@ -34,7 +34,6 @@ IMAGE_DIR = "problem_images"
 if not os.path.exists(IMAGE_DIR):
     os.makedirs(IMAGE_DIR)
 
-# [최적화 1] 연결 객체 캐싱
 @st.cache_resource
 def init_connection():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -42,78 +41,44 @@ def init_connection():
     client = gspread.authorize(creds)
     return client
 
-# [최적화 2] 데이터 로드 캐싱 + 재시도 로직
-# ttl=60 -> 300(5분)으로 늘려 불필요한 호출 감소
-@st.cache_data(ttl=300)
+# [속도 개선] TTL(캐시 유지 시간)을 10분(600초)으로 늘려 접속 빈도 감소
+@st.cache_data(ttl=600)
 def load_data(worksheet_name, columns):
-    """구글 시트에서 데이터를 가져옵니다. (재시도 로직 적용)"""
-    # 최대 5번까지 재시도
-    for attempt in range(5):
+    try:
+        client = init_connection()
+        sheet = client.open(SHEET_NAME)
         try:
-            client = init_connection()
-            sheet = client.open(SHEET_NAME)
-            try:
-                worksheet = sheet.worksheet(worksheet_name)
-                data = worksheet.get_all_records()
-                df = pd.DataFrame(data)
-                
-                df = df.astype(str) # 문자열 변환
-                
-                for col in columns:
-                    if col not in df.columns:
-                        df[col] = ""
-                return df
-            except gspread.WorksheetNotFound:
-                worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
-                worksheet.append_row(columns)
-                return pd.DataFrame(columns=columns)
-                
-        except APIError as e:
-            # 429 에러(접속량 초과)일 경우 잠시 대기 후 재시도
-            if e.response.status_code == 429:
-                time.sleep((2 ** attempt) + random.random()) # 1초, 2초, 4초... 점진적 대기
-                continue
-            else:
-                return pd.DataFrame(columns=columns)
-        except Exception:
-            # 그 외 에러 시 빈 데이터 반환 (앱 다운 방지)
+            worksheet = sheet.worksheet(worksheet_name)
+            data = worksheet.get_all_records()
+            df = pd.DataFrame(data)
+            df = df.astype(str)
+            for col in columns:
+                if col not in df.columns:
+                    df[col] = ""
+            return df
+        except gspread.WorksheetNotFound:
+            worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
+            worksheet.append_row(columns)
             return pd.DataFrame(columns=columns)
-            
-    return pd.DataFrame(columns=columns)
+    except Exception as e:
+        return pd.DataFrame(columns=columns)
 
-# [최적화 3] 데이터 저장 + 재시도 로직
+# 데이터 저장 (즉시 반영이 필요한 경우 사용)
 def save_data(worksheet_name, new_df):
-    """구글 시트에 데이터를 저장합니다. (재시도 로직 적용)"""
-    for attempt in range(5):
+    try:
+        client = init_connection()
+        sheet = client.open(SHEET_NAME)
         try:
-            client = init_connection()
-            sheet = client.open(SHEET_NAME)
-            try:
-                worksheet = sheet.worksheet(worksheet_name)
-            except gspread.WorksheetNotFound:
-                worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
-            
-            # 데이터프레임 내용을 리스트로 변환
-            params = [new_df.columns.values.tolist()] + new_df.values.tolist()
-            
-            worksheet.clear()
-            worksheet.update(params)
-            
-            # 저장 성공 시 캐시 비우고 종료
-            st.cache_data.clear()
-            return 
-            
-        except APIError as e:
-            if e.response.status_code == 429:
-                st.toast(f"⏳ 서버가 바빠서 잠시 기다립니다... ({attempt+1}/5)", icon="🕒")
-                time.sleep((2 ** attempt) + random.random())
-                continue
-            else:
-                st.error(f"저장 중 API 오류 발생: {e}")
-                return
-        except Exception as e:
-            st.error(f"저장 중 오류 발생: {e}")
-            return
+            worksheet = sheet.worksheet(worksheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = sheet.add_worksheet(title=worksheet_name, rows=100, cols=20)
+        
+        params = [new_df.columns.values.tolist()] + new_df.values.tolist()
+        worksheet.clear()
+        worksheet.update(params)
+        st.cache_data.clear() # 데이터가 바뀌었으니 캐시 초기화
+    except Exception as e:
+        st.error(f"저장 오류: {e}")
 
 # --- 유틸리티 함수들 ---
 def make_hashes(password):
@@ -131,7 +96,6 @@ def get_yt_start_time(url):
     return int(match.group(2)) if match else 0
 
 # --- 초기 계정 세팅 ---
-# (캐싱된 load_data 사용)
 df_check = load_data('users', ['id'])
 if df_check.empty:
     default_users = pd.DataFrame([
@@ -152,6 +116,7 @@ if 'logged_in' not in st.session_state: st.session_state.update({'logged_in': Fa
 if 'cal_view_date' not in st.session_state: st.session_state['cal_view_date'] = None
 if 'last_result' not in st.session_state: st.session_state['last_result'] = None 
 if 'current_options' not in st.session_state: st.session_state['current_options'] = None
+if 'session_results' not in st.session_state: st.session_state['session_results'] = [] # [NEW] 결과 임시 저장용
 
 st.markdown("""
     <style>
@@ -191,7 +156,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 4. [기능] 단어 암기 프로그램
+# 4. [기능] 단어 암기 프로그램 (배치 처리 최적화)
 # ==========================================
 def start_flashcard_session(word_list, user_id, mode, test_info=""):
     random.shuffle(word_list)
@@ -199,9 +164,83 @@ def start_flashcard_session(word_list, user_id, mode, test_info=""):
         'vocab_session': True, 'study_list': word_list, 'current_word_idx': 0,
         'show_meaning': False, 'session_mode': mode, 'session_user': user_id,
         'test_score': 0, 'test_info': test_info, 'last_result': None, 
-        'show_answer_sub': False, 'current_options': None
+        'show_answer_sub': False, 'current_options': None,
+        'session_results': [] # 결과 임시 저장소
     })
     st.rerun()
+
+# [속도 개선] 결과를 메모리에 모았다가 한 번에 DB에 저장하는 함수
+def save_session_results_batch():
+    user_id = st.session_state['session_user']
+    mode = st.session_state['session_mode']
+    results = st.session_state['session_results']
+    
+    if not results: return
+
+    # 1. 학습 진도 업데이트 (vocab_prog)
+    if 'test' not in mode:
+        df_prog = load_data('vocab_prog', ['student_id', 'book', 'word', 'streak', 'status'])
+        
+        # 반복문으로 데이터프레임 업데이트 (DB 호출 X)
+        for res in results:
+            word_data = res['word_data']
+            is_correct = res['is_correct']
+            
+            mask = (df_prog['student_id'] == user_id) & (df_prog['book'] == word_data.get('book','')) & (df_prog['word'] == word_data['word'])
+            current = df_prog[mask]
+            
+            streak = int(float(current.iloc[0]['streak'])) if not current.empty else 0
+            current_status = current.iloc[0]['status'] if not current.empty else 'learning'
+            master_threshold = 2 if mode == 'subjective' or current_status == 'learning' else 4
+
+            if is_correct:
+                streak += 1
+                status = 'mastered' if streak >= master_threshold else 'learning'
+            else:
+                streak = 0
+                status = 'learning'
+            
+            # 기존 행 삭제 후 새 행 추가 (메모리 상에서)
+            df_prog = df_prog[~mask]
+            new_row = pd.DataFrame([{
+                'student_id': user_id, 'book': word_data.get('book',''), 'word': word_data['word'], 
+                'streak': streak, 'status': status
+            }])
+            df_prog = pd.concat([df_prog, new_row], ignore_index=True)
+            
+        # 한 번에 저장 (DB 호출 1회)
+        save_data('vocab_prog', df_prog)
+
+    # 2. 누적 테스트 오답 저장 (vocab_test_wrongs)
+    if 'test' in mode:
+        df_tw = load_data('vocab_test_wrongs', ['student_id', 'book', 'word', 'date'])
+        new_wrongs = []
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        for res in results:
+            if not res['is_correct']:
+                word_data = res['word_data']
+                if not ((df_tw['student_id'] == user_id) & (df_tw['word'] == word_data['word'])).any():
+                    new_wrongs.append({
+                        'student_id': user_id, 'book': word_data.get('book',''), 
+                        'word': word_data['word'], 'date': today
+                    })
+        
+        if new_wrongs:
+            save_data('vocab_test_wrongs', pd.concat([df_tw, pd.DataFrame(new_wrongs)], ignore_index=True))
+
+    # 3. 테스트 점수 저장 (vocab_test_log)
+    if 'test' in mode:
+        score = st.session_state['test_score']
+        total = len(st.session_state['study_list'])
+        df_test = load_data('vocab_test_log', ['student_id', 'date', 'info', 'score'])
+        new_log = pd.DataFrame([{
+            'student_id': user_id,
+            'date': datetime.now().strftime("%Y-%m-%d %H:%M"),
+            'info': st.session_state['test_info'],
+            'score': f"{score}/{total}"
+        }])
+        save_data('vocab_test_log', pd.concat([df_test, new_log], ignore_index=True))
 
 def render_flashcard_session():
     if not st.session_state.get('vocab_session'): return
@@ -211,30 +250,30 @@ def render_flashcard_session():
     study_list = st.session_state['study_list']
     total = len(study_list)
     mode = st.session_state['session_mode']
-    user_id = st.session_state['session_user']
     
+    # 종료 화면
     if idx >= total:
         if 'test' in mode:
             score = st.session_state['test_score']
             st.balloons()
             st.success(f"## 🏁 테스트 종료! 점수: {score} / {total}")
-            if st.button("결과 저장 및 종료", type="primary", key="btn_save_test", use_container_width=True):
-                df_test = load_data('vocab_test_log', ['student_id', 'date', 'info', 'score'])
-                new_log = pd.DataFrame([{
-                    'student_id': user_id,
-                    'date': datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    'info': st.session_state['test_info'],
-                    'score': f"{score}/{total}"
-                }])
-                save_data('vocab_test_log', pd.concat([df_test, new_log], ignore_index=True))
+            st.info("결과를 서버에 저장 중입니다...")
+            
+            # [최적화] 종료 시점에 한 번 저장
+            save_session_results_batch()
+            
+            if st.button("홈으로 돌아가기", type="primary", key="btn_end_test"):
                 st.session_state['vocab_session'] = False
-                st.session_state['last_result'] = None
                 st.rerun()
         else:
             st.success("✅ 학습이 완료되었습니다!")
-            if st.button("종료", key="btn_end_learn", use_container_width=True):
+            st.info("학습 결과를 저장 중입니다...")
+            
+            # [최적화] 종료 시점에 한 번 저장
+            save_session_results_batch()
+            
+            if st.button("홈으로 돌아가기", key="btn_end_learn"):
                 st.session_state['vocab_session'] = False
-                st.session_state['last_result'] = None
                 st.rerun()
         return
 
@@ -250,101 +289,49 @@ def render_flashcard_session():
     if st.session_state['last_result'] == 'correct': card_class += " correct"
     elif st.session_state['last_result'] == 'wrong': card_class += " wrong"
 
-    # [모드 1] 객관식
-    if mode == 'test_objective':
-        st.markdown(f"""
-            <div class="{card_class}">
-                <div class="book-badge">{book_text}</div>
-                <div class="word-text">{word_text}</div>
-            </div>
-        """, unsafe_allow_html=True)
-        
+    # [UI 렌더링 - 변경 없음, 로직만 변경]
+    # ... (생략된 UI 코드는 기존과 동일하되, 버튼 클릭 시 process_answer_local 호출)
+    
+    if mode == 'test_objective': # 객관식
+        st.markdown(f"""<div class="{card_class}"><div class="book-badge">{book_text}</div><div class="word-text">{word_text}</div></div>""", unsafe_allow_html=True)
         if st.session_state['current_options'] is None:
-            df_vocab = load_data('vocab', ['book', 'word', 'meaning'])
-            same_book_words = df_vocab[df_vocab['book'] == book_text]['meaning'].tolist()
-            if len(same_book_words) < 4: same_book_words = df_vocab['meaning'].tolist()
-            
-            distractors = list(set([m for m in same_book_words if m != meaning_text]))
-            if len(distractors) >= 3: options = random.sample(distractors, 3) + [meaning_text]
-            else: options = distractors + [meaning_text]
-            random.shuffle(options)
-            st.session_state['current_options'] = options
-            
-        options = st.session_state['current_options']
+            df_vocab = load_data('vocab', ['book', 'word', 'meaning']) # 캐싱된 데이터 사용
+            same_book = df_vocab[df_vocab['book'] == book_text]['meaning'].tolist()
+            if len(same_book) < 4: same_book = df_vocab['meaning'].tolist()
+            distractors = list(set([m for m in same_book if m != meaning_text]))
+            opts = random.sample(distractors, 3) + [meaning_text] if len(distractors) >= 3 else distractors + [meaning_text]
+            random.shuffle(opts)
+            st.session_state['current_options'] = opts
         
-        for i, opt in enumerate(options):
+        for i, opt in enumerate(st.session_state['current_options']):
             if st.button(opt, key=f"opt_{idx}_{i}", use_container_width=True):
-                if opt == meaning_text:
-                    st.toast("정답입니다! 🎉", icon="✅")
-                    st.session_state['last_result'] = 'correct'
-                    update_vocab_progress(user_id, current_word, is_correct=True, mode=mode)
-                    st.session_state['current_word_idx'] += 1
-                    st.session_state['current_options'] = None
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    st.session_state['last_result'] = 'wrong'
-                    st.toast(f"틀렸습니다. 정답: {meaning_text}", icon="❌")
-                    update_vocab_progress(user_id, current_word, is_correct=False, mode=mode)
-                    st.session_state['current_word_idx'] += 1
-                    st.session_state['current_options'] = None
-                    time.sleep(1.0)
-                    st.rerun()
+                correct = (opt == meaning_text)
+                process_answer_local(current_word, correct, mode)
 
-    # [모드 2] 주관식 (비밀번호 타입)
-    elif mode == 'subjective' or mode == 'test_subjective':
-        st.markdown(f"""
-            <div class="{card_class}">
-                <div class="book-badge">{book_text}</div>
-                <div class="meaning-text" style="color:#333;">{meaning_text}</div>
-                <div style="color:#999; margin-top:20px;">영어 단어를 입력하세요</div>
-            </div>
-        """, unsafe_allow_html=True)
-        
+    elif mode == 'subjective' or mode == 'test_subjective': # 주관식
+        st.markdown(f"""<div class="{card_class}"><div class="book-badge">{book_text}</div><div class="meaning-text" style="color:#333;">{meaning_text}</div><div style="color:#999; margin-top:20px;">영어 단어를 입력하세요</div></div>""", unsafe_allow_html=True)
         if not st.session_state['show_answer_sub']:
             with st.form(key=f"sub_form_{idx}"):
                 user_input = st.text_input("정답 입력", key=f"input_{idx}", type="password").strip()
                 sub_btn = st.form_submit_button("제출", type="primary", use_container_width=True)
                 giveup_btn = st.form_submit_button("모르겠어요 (정답)", use_container_width=True)
-            
             if sub_btn:
-                if user_input.lower() == word_text.lower():
-                    st.session_state['last_result'] = 'correct'
-                    update_vocab_progress(user_id, current_word, is_correct=True, mode=mode)
-                    st.session_state['current_word_idx'] += 1
-                    time.sleep(0.5)
-                    st.rerun()
-                else:
-                    st.session_state['last_result'] = 'wrong'
-                    st.error("틀렸습니다. 다시 시도해보세요.")
-            
+                correct = (user_input.lower() == word_text.lower())
+                if not correct: st.error("틀렸습니다.")
+                else: process_answer_local(current_word, True, mode)
             if giveup_btn:
                 st.session_state['last_result'] = 'wrong'
                 st.session_state['show_answer_sub'] = True
                 st.rerun()
         else:
             st.error(f"정답: {word_text}")
-            st.warning("스펠링을 따라 쓰고 넘어가세요.")
             with st.form(key=f"copy_form_{idx}"):
-                copy_input = st.text_input("따라 쓰기", key=f"copy_{idx}")
-                next_btn = st.form_submit_button("다음 문제", type="primary", use_container_width=True)
-            if next_btn:
-                update_vocab_progress(user_id, current_word, is_correct=False, mode=mode)
-                st.session_state['show_answer_sub'] = False
-                st.session_state['last_result'] = None
-                st.session_state['current_word_idx'] += 1
-                st.rerun()
+                st.text_input("따라 쓰기", key=f"copy_{idx}")
+                if st.form_submit_button("다음 문제", type="primary"):
+                    process_answer_local(current_word, False, mode)
 
-    # [모드 3] 플래시카드
-    else:
-        st.markdown(f"""
-            <div class="{card_class}">
-                <div class="book-badge">{book_text}</div>
-                <div class="word-text">{word_text}</div>
-                {'<div class="meaning-text">' + meaning_text + '</div>' if st.session_state['show_meaning'] else '<div style="color:#999; margin-top:20px;">(터치하여 뜻 확인)</div>'}
-            </div>
-        """, unsafe_allow_html=True)
-
+    else: # 플래시카드
+        st.markdown(f"""<div class="{card_class}"><div class="book-badge">{book_text}</div><div class="word-text">{word_text}</div>{'<div class="meaning-text">' + meaning_text + '</div>' if st.session_state['show_meaning'] else '<div style="color:#999; margin-top:20px;">(터치하여 뜻 확인)</div>'}</div>""", unsafe_allow_html=True)
         if not st.session_state['show_meaning']:
             if st.button("뜻 확인하기 👁️", use_container_width=True, key=f"rev_{idx}"):
                 st.session_state['show_meaning'] = True
@@ -352,59 +339,35 @@ def render_flashcard_session():
         else:
             c1, c2 = st.columns(2)
             if c1.button("⭕ 알아요", type="primary", use_container_width=True, key=f"ok_{idx}"):
-                st.session_state['last_result'] = 'correct'
-                update_vocab_progress(user_id, current_word, is_correct=True, mode=mode)
-                st.session_state['current_word_idx'] += 1
-                st.session_state['show_meaning'] = False
-                time.sleep(0.3)
-                st.rerun()
+                process_answer_local(current_word, True, mode)
             if c2.button("❌ 몰라요", use_container_width=True, key=f"no_{idx}"):
-                st.session_state['last_result'] = 'wrong'
-                update_vocab_progress(user_id, current_word, is_correct=False, mode=mode)
-                st.session_state['current_word_idx'] += 1
-                st.session_state['show_meaning'] = False
-                time.sleep(0.3)
-                st.rerun()
+                process_answer_local(current_word, False, mode)
+    
     st.progress((idx)/total)
 
-def update_vocab_progress(user_id, word_data, is_correct, mode):
-    if 'test' in mode:
-        if is_correct: 
-            st.session_state['test_score'] += 1
-            return 
-        else:
-            df_t_wrong = load_data('vocab_test_wrongs', ['student_id', 'book', 'word', 'date'])
-            if not ((df_t_wrong['student_id'] == user_id) & (df_t_wrong['word'] == word_data['word'])).any():
-                new_w = pd.DataFrame([{
-                    'student_id': user_id, 'book': word_data.get('book',''), 
-                    'word': word_data['word'], 'date': datetime.now().strftime("%Y-%m-%d")
-                }])
-                save_data('vocab_test_wrongs', pd.concat([df_t_wrong, new_w], ignore_index=True))
-            return
-
-    df_prog = load_data('vocab_prog', ['student_id', 'book', 'word', 'streak', 'status'])
-    mask = (df_prog['student_id'] == user_id) & (df_prog['book'] == word_data.get('book','')) & (df_prog['word'] == word_data['word'])
-    current = df_prog[mask]
+# [속도 개선] 로컬 세션에만 결과 저장하고 화면 넘김 (DB 통신 X)
+def process_answer_local(word_data, is_correct, mode):
+    # 결과 임시 저장
+    st.session_state['session_results'].append({
+        'word_data': word_data,
+        'is_correct': is_correct
+    })
     
-    streak = int(float(current.iloc[0]['streak'])) if not current.empty else 0
-    current_status = current.iloc[0]['status'] if not current.empty else 'learning'
-    master_threshold = 2 if mode == 'subjective' or current_status == 'learning' else 4
-
     if is_correct:
-        streak += 1
-        status = 'mastered' if streak >= master_threshold else 'learning'
-        if status == 'mastered' and 'test' not in mode: st.toast("👑 마스터 완료!", icon="🎉")
+        st.session_state['last_result'] = 'correct'
+        if 'test' in mode: st.session_state['test_score'] += 1
+        st.toast("정답!", icon="✅")
     else:
-        streak = 0
-        status = 'learning'
-        if 'test' not in mode: st.toast("오답노트 저장", icon="🔥")
+        st.session_state['last_result'] = 'wrong'
+        st.toast("오답!", icon="❌")
 
-    df_prog = df_prog[~mask]
-    new_row = pd.DataFrame([{
-        'student_id': user_id, 'book': word_data.get('book',''), 'word': word_data['word'], 
-        'streak': streak, 'status': status
-    }])
-    save_data('vocab_prog', pd.concat([df_prog, new_row], ignore_index=True))
+    st.session_state['current_word_idx'] += 1
+    st.session_state['show_meaning'] = False
+    st.session_state['current_options'] = None
+    st.session_state['show_answer_sub'] = False
+    
+    time.sleep(0.5) # 시각 효과 보여줄 짧은 대기
+    st.rerun()
 
 def vocab_study_session(user_id):
     st.subheader("🧠 단어 마스터 프로그램")
@@ -421,10 +384,8 @@ def vocab_study_session(user_id):
         b_vocab = df_vocab[df_vocab['book'] == s_book]
         days = sorted(b_vocab['day'].unique(), key=natural_sort_key)
         s_day = c2.selectbox("Day", days, key="vd")
-        
         target = b_vocab[b_vocab['day'] == s_day]
         st.caption(f"총 {len(target)} 단어")
-        
         mode_radio = st.radio("학습 방식", ["플래시카드 (보고 외우기)", "주관식 (스펠링 쓰기)"], horizontal=True, key="chap_mode")
         mode_code = 'subjective' if "주관식" in mode_radio else 'learning'
 
@@ -433,16 +394,14 @@ def vocab_study_session(user_id):
             study_list = []
             for _, r in target.iterrows():
                 p = df_prog[(df_prog['student_id']==user_id) & (df_prog['word']==r['word'])]
-                if not (not p.empty and p.iloc[0]['status'] == 'mastered'):
-                    study_list.append(r.to_dict())
+                if not (not p.empty and p.iloc[0]['status'] == 'mastered'): study_list.append(r.to_dict())
             start_flashcard_session(study_list, user_id, mode_code)
             
         if c_w.button("❌ 오답만", key="btn_learn_wrong_chap", use_container_width=True):
             study_list = []
             for _, r in target.iterrows():
                 p = df_prog[(df_prog['student_id']==user_id) & (df_prog['word']==r['word'])]
-                if not p.empty and p.iloc[0]['status'] == 'learning':
-                    study_list.append(r.to_dict())
+                if not p.empty and p.iloc[0]['status'] == 'learning': study_list.append(r.to_dict())
             if study_list: start_flashcard_session(study_list, user_id, mode_code)
             else: st.info("오답 없음")
 
@@ -453,10 +412,8 @@ def vocab_study_session(user_id):
             w_details = pd.merge(wrongs, df_vocab, on=['book', 'word'], how='left')[['book', 'day', 'word', 'meaning', 'streak']]
             st.dataframe(w_details, use_container_width=True)
             c_o1, c_o2 = st.columns(2)
-            if c_o1.button("🔥 플래시카드 재학습", key="btn_wr_flash", use_container_width=True): 
-                start_flashcard_session(w_details.to_dict('records'), user_id, "learning")
-            if c_o2.button("✍️ 주관식 재학습", key="btn_wr_sub", use_container_width=True): 
-                start_flashcard_session(w_details.to_dict('records'), user_id, "subjective")
+            if c_o1.button("🔥 플래시카드 재학습", key="btn_wr_flash", use_container_width=True): start_flashcard_session(w_details.to_dict('records'), user_id, "learning")
+            if c_o2.button("✍️ 주관식 재학습", key="btn_wr_sub", use_container_width=True): start_flashcard_session(w_details.to_dict('records'), user_id, "subjective")
 
     with t3:
         masters = df_prog[(df_prog['student_id']==user_id) & (df_prog['status']=='mastered')]
@@ -464,18 +421,15 @@ def vocab_study_session(user_id):
         else:
             m_details = pd.merge(masters, df_vocab, on=['book', 'word'], how='left')[['book', 'day', 'word', 'meaning']]
             st.dataframe(m_details, use_container_width=True)
-            if st.button("♻️ 마스터 단어 복습", key="btn_review_master", use_container_width=True): 
-                start_flashcard_session(m_details.to_dict('records'), user_id, "review")
+            if st.button("♻️ 마스터 단어 복습", key="btn_review_master", use_container_width=True): start_flashcard_session(m_details.to_dict('records'), user_id, "review")
 
     with t4:
         st.write("##### 누적 실전 모의고사")
         t_book = st.selectbox("책 선택", sorted(df_vocab['book'].unique()), key="tb")
         t_v = df_vocab[df_vocab['book']==t_book]
         t_days = sorted(t_v['day'].unique(), key=natural_sort_key)
-        
         s_d = st.selectbox("시작 Day", t_days, key="tsd")
         e_d = st.selectbox("종료 Day", t_days, index=len(t_days)-1, key="ted")
-        
         test_type = st.radio("테스트 방식", ["객관식(4지 선다)", "주관식(스펠링)"], horizontal=True, key="test_type")
         t_mode = "test_objective" if "객관식" in test_type else "test_subjective" 
 
@@ -499,23 +453,17 @@ def vocab_study_session(user_id):
         st.write("##### 🚧 누적 테스트 오답 노트")
         df_tw = load_data('vocab_test_wrongs', ['student_id', 'book', 'word', 'date'])
         my_tw = df_tw[df_tw['student_id'] == user_id]
-        
         if my_tw.empty: st.info("누적 테스트 오답이 없습니다.")
         else:
             tw_details = pd.merge(my_tw, df_vocab, on=['book', 'word'], how='left')[['date', 'book', 'word', 'meaning']]
             st.dataframe(tw_details, use_container_width=True)
-            
             if st.button("🔥 오답 학습하기", key="btn_study_tw", use_container_width=True):
                 start_flashcard_session(tw_details.to_dict('records'), user_id, "learning")
-            
-            st.divider()
-            st.caption("오답 삭제")
             del_w = st.selectbox("삭제할 단어 선택", tw_details['word'], key="sel_del_tw")
-            if c_tr2.button("삭제", key="btn_del_tw", use_container_width=True):
+            if st.button("삭제", key="btn_del_tw", use_container_width=True):
                 df_tw = df_tw[~((df_tw['student_id']==user_id) & (df_tw['word']==del_w))]
                 save_data('vocab_test_wrongs', df_tw)
                 st.rerun()
-
     render_flashcard_session()
 
 # ==========================================
